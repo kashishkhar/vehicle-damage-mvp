@@ -61,7 +61,7 @@ function CanvasOverlay({
   items,
   show,
 }: {
-  imgRef: React.RefObject<HTMLImageElement>;
+  imgRef: React.RefObject<HTMLImageElement | null>;
   items: DamageItem[];
   show: boolean;
 }) {
