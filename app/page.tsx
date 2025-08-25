@@ -1,9 +1,6 @@
-/* eslint-disable @next/next/no-img-element */
-// app/page.tsx
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { AnalyzeResponse, DamageItem } from "@/app/types";
 
 /** Confidence bands (config via env) */
 const CONF_HIGH = Number(process.env.NEXT_PUBLIC_CONF_HIGH ?? 0.85);
@@ -26,7 +23,8 @@ async function compressImage(file: File, maxW = 1600, quality = 0.72): Promise<F
     reader.onload = () => { img.src = reader.result as string; img.onload = () => resolve(); img.onerror = reject; };
     reader.onerror = reject;
   });
-  reader.readAsDataURL(file); await load;
+  reader.readAsDataURL(file);
+  await load;
   const scale = Math.min(1, maxW / img.width);
   const w = Math.round(img.width * scale), h = Math.round(img.height * scale);
   const canvas = document.createElement("canvas"); canvas.width = w; canvas.height = h;
@@ -55,14 +53,14 @@ function colorForSeverity(sev: number) {
   return "#10b981";
 }
 
-/** Canvas overlay for normalized boxes/polygons */
+/** Canvas overlay for boxes/polygons (normalized coords) */
 function CanvasOverlay({
   imgRef,
   items,
   show,
 }: {
-  imgRef: React.RefObject<HTMLImageElement | null>;
-  items: DamageItem[];
+  imgRef: React.RefObject<HTMLImageElement>;
+  items: any[];
   show: boolean;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -99,7 +97,8 @@ function CanvasOverlay({
         pts.forEach(([nx, ny], i) => {
           const x = nx * rect.width;
           const y = ny * rect.height;
-          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
         });
         ctx.closePath();
         ctx.fill();
@@ -140,58 +139,78 @@ function drawLabel(ctx: CanvasRenderingContext2D, text: string, x: number, y: nu
   ctx.restore();
 }
 
-/** Pretty toggle */
-function Toggle({
+/** Simple checkbox */
+function Checkbox({
   checked,
   onChange,
   label,
+  id,
 }: {
   checked: boolean;
   onChange: (v: boolean) => void;
   label: string;
+  id: string;
 }) {
   return (
-    <button
-      type="button"
-      onClick={() => onChange(!checked)}
-      className="group inline-flex items-center gap-2 select-none"
-      aria-pressed={checked}
-    >
-      <span className={`relative h-6 w-11 rounded-full transition-colors ${checked ? "bg-black/90" : "bg-neutral-300"}`}>
-        <span
-          className={`absolute top-[2px] h-5 w-5 rounded-full bg-white shadow transition-transform ${
-            checked ? "translate-x-[22px]" : "translate-x-[2px]"
-          }`}
-        />
-      </span>
-      <span className="text-sm text-neutral-700">{label}</span>
-    </button>
+    <label htmlFor={id} className="flex items-center gap-2 text-sm text-neutral-800 select-none">
+      <input
+        id={id}
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        className="h-4 w-4 accent-black"
+      />
+      {label}
+    </label>
   );
 }
 
-/** Build a textual summary paragraph */
-function buildDamageSummary(result: AnalyzeResponse | null) {
-  const items: DamageItem[] = Array.isArray(result?.damage_items) ? result!.damage_items : [];
+/** Build a concise, professional damage summary paragraph */
+function buildDamageSummary(result: any): string {
+  const items: any[] = Array.isArray(result?.damage_items) ? result.damage_items : [];
   if (!items.length) return result?.narrative || "No visible damage detected.";
 
-  const parts: string[] = items.map((d) => {
-    let desc = `a ${d.damage_type} on the ${d.zone} ${d.part}`;
-    if (d.severity >= 4) desc = `severe ${desc}`;
-    else if (d.severity === 3) desc = `moderate ${desc}`;
-    else if (d.severity <= 2) desc = `minor ${desc}`;
-    if (d.needs_paint) desc += ` requiring paint work`;
+  const phrases: string[] = items.map((d) => {
+    // Normalize severity to text
+    let sevText = "minor";
+    if (d.severity >= 5) sevText = "severe";
+    else if (d.severity === 4) sevText = "major";
+    else if (d.severity === 3) sevText = "moderate";
+
+    // Damage type dictionary
+    const typeMap: Record<string, string> = {
+      dent: "dent",
+      scratch: "surface scratch",
+      crack: "structural crack",
+      "paint-chips": "paint chipping",
+      broken: "broken component",
+      bent: "bent panel",
+      missing: "missing component",
+      "glass-crack": "glass fracture",
+      unknown: "unspecified damage",
+    };
+    const typeText = typeMap[d.damage_type] || d.damage_type;
+
+    // Zone + part phrasing
+    const zonePart = [d.zone, d.part].filter(Boolean).join(" ");
+
+    // Build phrase
+    let phrase = `${sevText} ${typeText} on the ${zonePart}`;
+    if (d.needs_paint) phrase += ` requiring repainting`;
     if (Array.isArray(d.likely_parts) && d.likely_parts.length) {
-      desc += ` with possible replacement of ${d.likely_parts.join(", ")}`;
+      phrase += ` with possible replacement of ${d.likely_parts.join(", ")}`;
     }
-    return desc;
+    return phrase;
   });
 
-  const joined = parts.length > 1 ? parts.slice(0, -1).join(", ") + " and " + parts.slice(-1) : parts[0];
-  const headline = `The vehicle shows ${joined}.`;
-  const note = result?.narrative ? ` ${result.narrative}` : "";
-  return headline + note;
-}
+  const joined =
+    phrases.length > 1
+      ? phrases.slice(0, -1).join(", ") + ", and " + phrases.slice(-1)
+      : phrases[0];
 
+  // Professional final paragraph
+  return `The inspection identified ${joined}. Based on the detected severity levels, professional repair work is recommended to restore the vehicle to safe operating condition.`;
+}
 /** Simple URL validator */
 function isLikelyImageUrl(u: string) {
   try {
@@ -208,7 +227,7 @@ export default function Home() {
   const [imageUrl, setImageUrl] = useState<string>("");
   const [preview, setPreview] = useState<string>("");
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<AnalyzeResponse | null>(null);
+  const [result, setResult] = useState<any>(null);
   const [error, setError] = useState<string>("");
   const [validationIssues, setValidationIssues] = useState<string[] | null>(null);
   const [showOverlay, setShowOverlay] = useState(true);
@@ -223,7 +242,11 @@ export default function Home() {
     setError("");
     setValidationIssues(null);
     setPreview("");
-    if (next === "upload") setImageUrl(""); else setFile(null);
+    if (next === "upload") {
+      setImageUrl("");
+    } else {
+      setFile(null);
+    }
   }
 
   function onFile(e: React.ChangeEvent<HTMLInputElement>) {
@@ -244,6 +267,7 @@ export default function Home() {
     setPreview(val || "");
   }
 
+  /** Validate (gentle) → Detect (YOLO) → Analyze (LLM + heuristics) */
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setLoading(true);
@@ -252,70 +276,67 @@ export default function Home() {
     setResult(null);
 
     try {
-      // validator payload JSON and analyze form
-      const validatorBody: Record<string, unknown> = {};
-      const analyzeForm = new FormData();
+      let analyzeForm = new FormData();
+      let detectForm = new FormData();
 
       if (mode === "upload") {
-        if (!file) { setError("Please choose a file."); setLoading(false); return; }
+        if (!file) { setError("Please choose a file."); return; }
         const compressed = await compressImage(file);
         const dataUrl = await fileToDataUrl(compressed);
-        validatorBody.image_data_url = dataUrl;
+        detectForm.append("file", compressed);
         analyzeForm.append("file", compressed);
+        analyzeForm.append("image_data_url", dataUrl);
       } else {
-        if (!urlValid) { setError("Please enter a valid http(s) image URL."); setLoading(false); return; }
-        validatorBody.imageUrl = imageUrl.trim();
+        if (!urlValid) { setError("Please enter a valid http(s) image URL."); return; }
+        detectForm.append("imageUrl", imageUrl.trim());
         analyzeForm.append("imageUrl", imageUrl.trim());
       }
 
-      // Gentle validator (ignore everything except 422)
-      const vr = await fetch("/api/validate-image", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(validatorBody),
-      }).catch(() => null);
-
-      if (vr) {
-        if (vr.status === 422) {
-          const t = await vr.text();
-          try {
-            const j = JSON.parse(t) as { message?: string; friendly_suggestions?: string[]; issues?: string[] };
-            setError(j?.message || "This photo may not be ideal for assessment.");
-            const list = j?.friendly_suggestions || j?.issues || null;
-            setValidationIssues(Array.isArray(list) ? list : null);
-          } catch {
-            setError("This photo may not be ideal for assessment.");
-          }
-          setLoading(false);
-          return;
-        }
-        if (vr.ok) {
-          try {
-            const j = (await vr.json()) as { friendly_suggestions?: string[]; warnings?: string[] };
-            const hints = j.friendly_suggestions?.length ? j.friendly_suggestions : j.warnings;
-            if (Array.isArray(hints) && hints.length) setValidationIssues(hints);
-          } catch { /* ignore */ }
-        }
-        // For any other status (e.g., 404 if the endpoint doesn’t exist), continue to analysis
+      // 1) DETECT
+      const dr = await fetch("/api/detect", { method: "POST", body: detectForm });
+      if (!dr.ok) {
+        const t = await dr.text();
+        setError(t || "Detection failed");
+        return;
       }
+      const detectJson = await dr.json();
 
-      // Analyze
+      // 2) ANALYZE (send YOLO seeds along)
+      const seeds = Array.isArray(detectJson?.damage_items)
+        ? detectJson.damage_items
+            .filter((d: any) => Array.isArray(d.bbox_rel) && d.bbox_rel.length === 4)
+            .map((d: any) => ({ bbox_rel: d.bbox_rel, confidence: d.confidence ?? 0.5 }))
+        : [];
+      analyzeForm.append("yolo", JSON.stringify(seeds));
+
       const ar = await fetch("/api/analyze", { method: "POST", body: analyzeForm });
       if (!ar.ok) {
         const t = await ar.text();
         setError(t || "Analysis failed");
-        setLoading(false);
         return;
       }
-      const j = (await ar.json()) as AnalyzeResponse;
+      const j = await ar.json();
       setResult(j);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : "Unexpected error";
-      setError(msg);
+
+      // surface non-blocking warnings if detect had any
+      if (Array.isArray(detectJson?.warnings) && detectJson.warnings.length) {
+        setValidationIssues(detectJson.warnings);
+      }
+    } catch (err: any) {
+      setError(err?.message || "Unexpected error");
     } finally {
       setLoading(false);
     }
   }
+
+  // ----- NEW: Export as PDF helper -----
+  function exportPdf() {
+    window.print();
+  }
+
+  const make = result?.vehicle?.make ?? "—";
+  const model = result?.vehicle?.model ?? "—";
+  const color = result?.vehicle?.color ?? "—";
 
   return (
     <main className="min-h-screen bg-white text-neutral-900">
@@ -331,9 +352,10 @@ export default function Home() {
 
       {/* Layout */}
       <div className="mx-auto max-w-7xl px-6 py-6 grid gap-6 lg:grid-cols-12">
-        {/* Left column */}
+        {/* Left: Image column */}
         <section className="lg:col-span-4">
           <div className="lg:sticky lg:top-6 space-y-4">
+            {/* Input Card */}
             <form onSubmit={handleSubmit} className="rounded-2xl border bg-white p-4 shadow-sm space-y-3">
               {/* Mode switch */}
               <div className="flex rounded-lg overflow-hidden border">
@@ -385,13 +407,12 @@ export default function Home() {
               {/* Validation warnings / suggestions */}
               {validationIssues && (
                 <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
-                  <div className="font-medium mb-1">Note: accuracy of the generated report may be affected by:</div>
+                  <div className="font-medium mb-1">Note: accuracy of this report may be affected by:</div>
                   <ul className="list-disc pl-5">
-                    {validationIssues.map((v, i) => <li key={i}>{String(v)}</li>)}
+                    {validationIssues.map((v, i) => (
+                      <li key={i}>{String(v)}</li>
+                    ))}
                   </ul>
-                  <div className="mt-2 text-[11px] text-amber-700">
-                    Tip: Take a well-lit, 3/4 angle photo with the damaged area clearly visible.
-                  </div>
                 </div>
               )}
 
@@ -402,10 +423,10 @@ export default function Home() {
                 </div>
               )}
 
-              {/* Toggles */}
+              {/* View options (checkboxes) */}
               <div className="pt-1 flex flex-col gap-2">
-                <Toggle checked={showOverlay} onChange={setShowOverlay} label="Show damage overlay" />
-                <Toggle checked={showAudit} onChange={setShowAudit} label="Show audit metadata" />
+                <Checkbox id="overlay" checked={showOverlay} onChange={setShowOverlay} label="Show damage overlay" />
+                <Checkbox id="audit" checked={showAudit} onChange={setShowAudit} label="Show audit metadata" />
               </div>
             </form>
 
@@ -417,6 +438,7 @@ export default function Home() {
               </div>
 
               <div className="relative">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
                 {preview ? (
                   <>
                     <img
@@ -426,7 +448,7 @@ export default function Home() {
                       className="w-full rounded-lg border max-h-[360px] object-contain bg-neutral-50"
                     />
                     {result?.damage_items && (
-                      <CanvasOverlay imgRef={imgRef} items={result.damage_items} show={showOverlay} />
+                      <CanvasOverlay imgRef={imgRef as React.RefObject<HTMLImageElement>} items={result.damage_items} show={showOverlay} />
                     )}
                   </>
                 ) : (
@@ -436,10 +458,21 @@ export default function Home() {
                 )}
               </div>
             </div>
+
+            {/* Export as PDF (NEW) */}
+            <button
+              type="button"
+              onClick={exportPdf}
+              disabled={!result}
+              className="w-full rounded-lg border bg-white hover:bg-neutral-50 text-sm py-2 shadow-sm disabled:opacity-50 print:hidden"
+              title={!result ? "Run an analysis to enable PDF export" : "Export report as PDF"}
+            >
+              Export report as PDF
+            </button>
           </div>
         </section>
 
-        {/* Right column */}
+        {/* Right: Report column */}
         <section className="lg:col-span-8 space-y-4">
           {/* Decision */}
           {result?.decision && (
@@ -461,7 +494,7 @@ export default function Home() {
               </div>
               {Array.isArray(result.decision.reasons) && result.decision.reasons.length > 0 && (
                 <ul className="mt-2 grid grid-cols-1 gap-1 pl-5 text-xs text-neutral-700 list-disc">
-                  {result.decision.reasons.map((r, i) => <li key={i}>{r}</li>)}
+                  {result.decision.reasons.map((r: string, i: number) => <li key={i}>{r}</li>)}
                 </ul>
               )}
             </div>
@@ -472,9 +505,9 @@ export default function Home() {
             <div className="rounded-2xl border bg-white p-5 shadow-sm">
               <div className="mb-2 text-sm font-medium">Vehicle metadata</div>
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-sm">
-                <div><span className="text-neutral-500">Make:</span> {result?.vehicle?.make ?? "—"}</div>
-                <div><span className="text-neutral-500">Model:</span> {result?.vehicle?.model ?? "—"}</div>
-                <div><span className="text-neutral-500">Color:</span> {result?.vehicle?.color ?? "—"}</div>
+                <div><span className="text-neutral-500">Make:</span> {make}</div>
+                <div><span className="text-neutral-500">Model:</span> {model}</div>
+                <div><span className="text-neutral-500">Color:</span> {color}</div>
               </div>
               <div className="mt-1 text-xs text-neutral-500">
                 Vehicle confidence: {fmtPct(result?.vehicle?.confidence)} ({confidenceBand(result?.vehicle?.confidence)})
@@ -482,11 +515,11 @@ export default function Home() {
             </div>
           )}
 
-          {/* Detected Damage */}
+          {/* Detected Damage — table */}
           {Array.isArray(result?.damage_items) && result.damage_items.length > 0 && (
             <div className="rounded-2xl border bg-white p-5 shadow-sm">
               <div className="mb-2 text-sm font-medium">Detected Damage</div>
-              <table className="w-full text-[13px] leading-5">
+              <table className="w-full text-[13px] leading-5 border-collapse">
                 <thead className="bg-neutral-50 text-neutral-700">
                   <tr>
                     <th className="p-2 text-left">Zone</th>
@@ -500,7 +533,7 @@ export default function Home() {
                   </tr>
                 </thead>
                 <tbody>
-                  {result.damage_items.map((d, i) => (
+                  {result.damage_items.map((d: any, i: number) => (
                     <tr key={i} className="border-b last:border-none align-top">
                       <td className="p-2">{d.zone}</td>
                       <td className="p-2">{d.part}</td>
@@ -521,7 +554,7 @@ export default function Home() {
             </div>
           )}
 
-          {/* Damage summary */}
+          {/* Damage summary (concise, professional English) */}
           {(result?.narrative || (Array.isArray(result?.damage_items) && result.damage_items.length > 0)) && (
             <div className="rounded-2xl border bg-white p-5 shadow-sm">
               <div className="mb-1 text-sm font-medium">Damage summary</div>
@@ -529,7 +562,7 @@ export default function Home() {
             </div>
           )}
 
-          {/* Estimate */}
+          {/* Estimate — bottom line only */}
           {result && (
             <div className="rounded-2xl border bg-white p-5 shadow-sm">
               <div className="mb-1 text-sm font-medium">Estimated Repair Cost</div>
@@ -539,9 +572,41 @@ export default function Home() {
               {Array.isArray(result?.estimate?.assumptions) && result.estimate.assumptions.length > 0 && (
                 <div className="mt-2 text-xs text-neutral-500">{result.estimate.assumptions.join(" • ")}</div>
               )}
-              <div className="mt-2 text-[11px] text-neutral-500">Visual pre-estimate only; final cost subject to teardown.</div>
             </div>
           )}
+
+          {/* Legend & Settings */}
+          <div className="rounded-2xl border bg-white p-5 shadow-sm">
+            <div className="mb-1 text-sm font-medium">Legend & Settings</div>
+            <div className="text-xs text-neutral-700 space-y-2">
+              <div>
+                <span className="font-medium">Routing:</span>{" "}
+                <span className="inline-flex gap-2 flex-wrap">
+                  <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5">AUTO-APPROVE</span>
+                  <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5">INVESTIGATE</span>
+                  <span className="rounded-full border border-rose-200 bg-rose-50 px-2 py-0.5">SPECIALIST</span>
+                </span>
+                <div className="mt-1 text-neutral-600">
+                  Decision uses severity, confidence, and estimated cost thresholds.
+                </div>
+              </div>
+              <div>
+                <span className="font-medium">Severity colors:</span>{" "}
+                1–2 (green) • 3 (yellow) • 4 (orange) • 5 (red)
+              </div>
+              <div>
+                <span className="font-medium">Confidence bands:</span>{" "}
+                High ≥ {Math.round(CONF_HIGH * 100)}% • Medium ≥ {Math.round(CONF_MED * 100)}% • otherwise Low
+              </div>
+              <div>
+                <span className="font-medium">Cost assumptions:</span>{" "}
+                Labor rate & paint/materials from environment; parts allowance added when severity is high or part replacements are likely.
+              </div>
+              <div className="text-neutral-500">
+                This report combines YOLO geometry for overlays and GPT vision for labeling and narrative.
+              </div>
+            </div>
+          </div>
 
           {/* Audit (toggle) */}
           {result && showAudit && (
@@ -565,6 +630,32 @@ export default function Home() {
           )}
         </section>
       </div>
+
+      {/* Print CSS for clean PDF export */}
+      <style jsx global>{`
+        @media print {
+          body {
+            -webkit-print-color-adjust: exact;
+            print-color-adjust: exact;
+            background: #fff !important;
+          }
+          header,
+          .print:hidden,
+          .print\\:hidden,
+          .lg\\:col-span-4 {
+            display: none !important;
+          }
+          .lg\\:col-span-8 {
+            grid-column: 1 / -1 !important;
+          }
+          .shadow-sm {
+            box-shadow: none !important;
+          }
+          .border {
+            border-color: #e5e7eb !important;
+          }
+        }
+      `}</style>
     </main>
   );
 }
