@@ -1,6 +1,9 @@
+/* eslint-disable @next/next/no-img-element */
+// app/page.tsx
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { AnalyzeResponse, DamageItem } from "@/app/types";
 
 /** Confidence bands (config via env) */
 const CONF_HIGH = Number(process.env.NEXT_PUBLIC_CONF_HIGH ?? 0.85);
@@ -32,6 +35,17 @@ async function compressImage(file: File, maxW = 1600, quality = 0.72): Promise<F
   return new File([blob], "upload.jpg", { type: "image/jpeg" });
 }
 
+/** Convert a File to data URL (for validator JSON) */
+async function fileToDataUrl(file: File): Promise<string> {
+  const reader = new FileReader();
+  const p = new Promise<string>((resolve, reject) => {
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = reject;
+  });
+  reader.readAsDataURL(file);
+  return p;
+}
+
 /** Severity color mapping */
 function colorForSeverity(sev: number) {
   if (sev >= 5) return "#dc2626";
@@ -41,14 +55,14 @@ function colorForSeverity(sev: number) {
   return "#10b981";
 }
 
-/** Canvas overlay for boxes/polygons (normalized coords) */
+/** Canvas overlay for normalized boxes/polygons */
 function CanvasOverlay({
   imgRef,
   items,
   show,
 }: {
   imgRef: React.RefObject<HTMLImageElement>;
-  items: any[];
+  items: DamageItem[];
   show: boolean;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -85,8 +99,7 @@ function CanvasOverlay({
         pts.forEach(([nx, ny], i) => {
           const x = nx * rect.width;
           const y = ny * rect.height;
-          if (i === 0) ctx.moveTo(x, y);
-          else ctx.lineTo(x, y);
+          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
         });
         ctx.closePath();
         ctx.fill();
@@ -144,11 +157,7 @@ function Toggle({
       className="group inline-flex items-center gap-2 select-none"
       aria-pressed={checked}
     >
-      <span
-        className={`relative h-6 w-11 rounded-full transition-colors ${
-          checked ? "bg-black/90" : "bg-neutral-300"
-        }`}
-      >
+      <span className={`relative h-6 w-11 rounded-full transition-colors ${checked ? "bg-black/90" : "bg-neutral-300"}`}>
         <span
           className={`absolute top-[2px] h-5 w-5 rounded-full bg-white shadow transition-transform ${
             checked ? "translate-x-[22px]" : "translate-x-[2px]"
@@ -160,9 +169,9 @@ function Toggle({
   );
 }
 
-/** Damage summary */
-function buildDamageSummary(result: any) {
-  const items: any[] = Array.isArray(result?.damage_items) ? result.damage_items : [];
+/** Build a textual summary paragraph */
+function buildDamageSummary(result: AnalyzeResponse | null) {
+  const items: DamageItem[] = Array.isArray(result?.damage_items) ? result!.damage_items : [];
   if (!items.length) return result?.narrative || "No visible damage detected.";
 
   const parts: string[] = items.map((d) => {
@@ -170,7 +179,6 @@ function buildDamageSummary(result: any) {
     if (d.severity >= 4) desc = `severe ${desc}`;
     else if (d.severity === 3) desc = `moderate ${desc}`;
     else if (d.severity <= 2) desc = `minor ${desc}`;
-
     if (d.needs_paint) desc += ` requiring paint work`;
     if (Array.isArray(d.likely_parts) && d.likely_parts.length) {
       desc += ` with possible replacement of ${d.likely_parts.join(", ")}`;
@@ -200,9 +208,9 @@ export default function Home() {
   const [imageUrl, setImageUrl] = useState<string>("");
   const [preview, setPreview] = useState<string>("");
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<any>(null);
+  const [result, setResult] = useState<AnalyzeResponse | null>(null);
   const [error, setError] = useState<string>("");
-  const [warnings, setWarnings] = useState<string[] | null>(null);
+  const [validationIssues, setValidationIssues] = useState<string[] | null>(null);
   const [showOverlay, setShowOverlay] = useState(true);
   const [showAudit, setShowAudit] = useState(false);
 
@@ -213,10 +221,9 @@ export default function Home() {
     setMode(next);
     setResult(null);
     setError("");
-    setWarnings(null);
+    setValidationIssues(null);
     setPreview("");
-    if (next === "upload") setImageUrl("");
-    else setFile(null);
+    if (next === "upload") setImageUrl(""); else setFile(null);
   }
 
   function onFile(e: React.ChangeEvent<HTMLInputElement>) {
@@ -224,7 +231,7 @@ export default function Home() {
     setFile(f);
     setResult(null);
     setError("");
-    setWarnings(null);
+    setValidationIssues(null);
     if (f) setPreview(URL.createObjectURL(f));
   }
 
@@ -233,40 +240,78 @@ export default function Home() {
     setImageUrl(val);
     setResult(null);
     setError("");
-    setWarnings(null);
+    setValidationIssues(null);
     setPreview(val || "");
   }
 
-  /** Single-call submit (no /api/validate-image) */
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setLoading(true);
     setError("");
-    setWarnings(null);
+    setValidationIssues(null);
     setResult(null);
 
     try {
-      const fd = new FormData();
+      // validator payload JSON and analyze form
+      const validatorBody: Record<string, unknown> = {};
+      const analyzeForm = new FormData();
+
       if (mode === "upload") {
-        if (!file) { setError("Please choose a file."); return; }
+        if (!file) { setError("Please choose a file."); setLoading(false); return; }
         const compressed = await compressImage(file);
-        fd.append("file", compressed);
+        const dataUrl = await fileToDataUrl(compressed);
+        validatorBody.image_data_url = dataUrl;
+        analyzeForm.append("file", compressed);
       } else {
-        if (!urlValid) { setError("Please enter a valid http(s) image URL."); return; }
-        fd.append("imageUrl", imageUrl.trim());
+        if (!urlValid) { setError("Please enter a valid http(s) image URL."); setLoading(false); return; }
+        validatorBody.imageUrl = imageUrl.trim();
+        analyzeForm.append("imageUrl", imageUrl.trim());
       }
 
-      const r = await fetch("/api/analyze", { method: "POST", body: fd });
-      const text = await r.text();
-      if (!r.ok) {
-        setError(text || "Analysis failed");
+      // Gentle validator (ignore everything except 422)
+      const vr = await fetch("/api/validate-image", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(validatorBody),
+      }).catch(() => null);
+
+      if (vr) {
+        if (vr.status === 422) {
+          const t = await vr.text();
+          try {
+            const j = JSON.parse(t) as { message?: string; friendly_suggestions?: string[]; issues?: string[] };
+            setError(j?.message || "This photo may not be ideal for assessment.");
+            const list = j?.friendly_suggestions || j?.issues || null;
+            setValidationIssues(Array.isArray(list) ? list : null);
+          } catch {
+            setError("This photo may not be ideal for assessment.");
+          }
+          setLoading(false);
+          return;
+        }
+        if (vr.ok) {
+          try {
+            const j = (await vr.json()) as { friendly_suggestions?: string[]; warnings?: string[] };
+            const hints = j.friendly_suggestions?.length ? j.friendly_suggestions : j.warnings;
+            if (Array.isArray(hints) && hints.length) setValidationIssues(hints);
+          } catch { /* ignore */ }
+        }
+        // For any other status (e.g., 404 if the endpoint doesn’t exist), continue to analysis
+      }
+
+      // Analyze
+      const ar = await fetch("/api/analyze", { method: "POST", body: analyzeForm });
+      if (!ar.ok) {
+        const t = await ar.text();
+        setError(t || "Analysis failed");
+        setLoading(false);
         return;
       }
-      const j = JSON.parse(text);
+      const j = (await ar.json()) as AnalyzeResponse;
       setResult(j);
-      if (Array.isArray(j?.warnings) && j.warnings.length) setWarnings(j.warnings);
-    } catch (err: any) {
-      setError(err?.message || "Unexpected error");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Unexpected error";
+      setError(msg);
     } finally {
       setLoading(false);
     }
@@ -284,9 +329,9 @@ export default function Home() {
         </div>
       </header>
 
-      {/* Layout: narrow left (image) / wide right (report) */}
+      {/* Layout */}
       <div className="mx-auto max-w-7xl px-6 py-6 grid gap-6 lg:grid-cols-12">
-        {/* Left: Image column */}
+        {/* Left column */}
         <section className="lg:col-span-4">
           <div className="lg:sticky lg:top-6 space-y-4">
             <form onSubmit={handleSubmit} className="rounded-2xl border bg-white p-4 shadow-sm space-y-3">
@@ -337,15 +382,15 @@ export default function Home() {
                 {loading ? "Analyzing…" : "Analyze"}
               </button>
 
-              {/* Photo quality note (non-blocking) */}
-              {warnings && (
+              {/* Validation warnings / suggestions */}
+              {validationIssues && (
                 <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
-                  <div className="font-medium mb-1">Note: accuracy of the report may be impacted by:</div>
+                  <div className="font-medium mb-1">Note: accuracy of the generated report may be affected by:</div>
                   <ul className="list-disc pl-5">
-                    {warnings.map((w, i) => <li key={i}>{String(w)}</li>)}
+                    {validationIssues.map((v, i) => <li key={i}>{String(v)}</li>)}
                   </ul>
                   <div className="mt-2 text-[11px] text-amber-700">
-                    Tip: a clear, well-lit 3/4 angle with the damaged area centered yields best results.
+                    Tip: Take a well-lit, 3/4 angle photo with the damaged area clearly visible.
                   </div>
                 </div>
               )}
@@ -372,7 +417,6 @@ export default function Home() {
               </div>
 
               <div className="relative">
-                {/* eslint-disable-next-line @next/next/no-img-element */}
                 {preview ? (
                   <>
                     <img
@@ -395,7 +439,7 @@ export default function Home() {
           </div>
         </section>
 
-        {/* Right: Report column */}
+        {/* Right column */}
         <section className="lg:col-span-8 space-y-4">
           {/* Decision */}
           {result?.decision && (
@@ -417,7 +461,7 @@ export default function Home() {
               </div>
               {Array.isArray(result.decision.reasons) && result.decision.reasons.length > 0 && (
                 <ul className="mt-2 grid grid-cols-1 gap-1 pl-5 text-xs text-neutral-700 list-disc">
-                  {result.decision.reasons.map((r: string, i: number) => <li key={i}>{r}</li>)}
+                  {result.decision.reasons.map((r, i) => <li key={i}>{r}</li>)}
                 </ul>
               )}
             </div>
@@ -456,7 +500,7 @@ export default function Home() {
                   </tr>
                 </thead>
                 <tbody>
-                  {result.damage_items.map((d: any, i: number) => (
+                  {result.damage_items.map((d, i) => (
                     <tr key={i} className="border-b last:border-none align-top">
                       <td className="p-2">{d.zone}</td>
                       <td className="p-2">{d.part}</td>
@@ -467,7 +511,9 @@ export default function Home() {
                       <td className="p-2 break-words">
                         {Array.isArray(d.likely_parts) && d.likely_parts.length ? d.likely_parts.join(", ") : "—"}
                       </td>
-                      <td className="p-2">{fmtPct(d.confidence)} ({confidenceBand(d.confidence)})</td>
+                      <td className="p-2">
+                        {fmtPct(d.confidence)} ({confidenceBand(d.confidence)})
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -479,9 +525,7 @@ export default function Home() {
           {(result?.narrative || (Array.isArray(result?.damage_items) && result.damage_items.length > 0)) && (
             <div className="rounded-2xl border bg-white p-5 shadow-sm">
               <div className="mb-1 text-sm font-medium">Damage summary</div>
-              <div className="text-sm leading-relaxed text-neutral-800">
-                {buildDamageSummary(result)}
-              </div>
+              <div className="text-sm leading-relaxed text-neutral-800">{buildDamageSummary(result)}</div>
             </div>
           )}
 
@@ -495,13 +539,11 @@ export default function Home() {
               {Array.isArray(result?.estimate?.assumptions) && result.estimate.assumptions.length > 0 && (
                 <div className="mt-2 text-xs text-neutral-500">{result.estimate.assumptions.join(" • ")}</div>
               )}
-              <div className="mt-2 text-[11px] text-neutral-500">
-                Visual pre-estimate only; final cost subject to teardown.
-              </div>
+              <div className="mt-2 text-[11px] text-neutral-500">Visual pre-estimate only; final cost subject to teardown.</div>
             </div>
           )}
 
-          {/* Audit */}
+          {/* Audit (toggle) */}
           {result && showAudit && (
             <div className="rounded-2xl border bg-white p-5 shadow-sm">
               <div className="mb-1 text-sm font-medium">Audit Metadata</div>
