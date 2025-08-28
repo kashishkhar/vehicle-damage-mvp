@@ -1,4 +1,12 @@
 // app/api/analyze/route.ts
+// --------------------------------------------------------------------------------------
+// Car Damage Estimator — Analyze Route (server)
+// - Accepts an uploaded image (file) or a public image URL
+// - Calls OpenAI Vision to produce structured damage JSON
+// - Normalizes/repairs the JSON, computes estimate + routing, and returns payload
+// - Functionality preserved; implementation clarified, typed, and documented
+// --------------------------------------------------------------------------------------
+
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import crypto from "crypto";
@@ -56,7 +64,7 @@ export type AnalyzePayload = {
   damage_summary: string;
 };
 
-/** ---------- Env ---------- */
+/** ---------- Env & Constants ---------- */
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 const MODEL_ID = process.env.MODEL_VISION || "gpt-4o-mini";
 
@@ -77,7 +85,7 @@ function sha256String(s: string) {
   return crypto.createHash("sha256").update(s, "utf8").digest("hex");
 }
 
-// Bodyshop-ish heuristics
+// Approximate bodyshop labor hours per part × severity multiplier
 function hoursFor(part: Part, sev: number) {
   const base =
     part === "bumper" ? 1.2 :
@@ -94,11 +102,15 @@ function hoursFor(part: Part, sev: number) {
   const sevMult = sev <= 1 ? 0.5 : sev === 2 ? 0.8 : sev === 3 ? 1.0 : sev === 4 ? 1.4 : 1.8;
   return +(base * sevMult).toFixed(2);
 }
+
+// Paint heuristic: most panels need paint above sev>=2; glass/lights typically do not
 function needsPaintFor(type: string, sev: number, part: Part) {
   if (["windshield", "headlight", "taillight", "mirror"].includes(part)) return false;
   if (type.includes("scratch") || type.includes("paint")) return true;
   return sev >= 2;
 }
+
+// Roll up labor/paint/parts → cost band with variance
 function estimateFromItems(items: DamageItem[]) {
   let labor = 0, paint = 0, parts = 0;
   const paintedZones = new Set<Zone>();
@@ -134,6 +146,8 @@ function estimateFromItems(items: DamageItem[]) {
     ],
   };
 }
+
+// Weighted average confidence (heavier weight for higher severity)
 function aggregateConfidence(items: DamageItem[]) {
   let num = 0, den = 0;
   for (const d of items) {
@@ -145,6 +159,8 @@ function aggregateConfidence(items: DamageItem[]) {
   }
   return den ? num / den : 0.5;
 }
+
+// Policy routing decision (kept identical to existing thresholds)
 function routeDecision(items: DamageItem[], estimate: { cost_high: number }) {
   const maxSev = items.reduce((m, d) => Math.max(m, Number(d.severity ?? 1)), 0);
   const agg = aggregateConfidence(items);
@@ -168,7 +184,7 @@ function routeDecision(items: DamageItem[], estimate: { cost_high: number }) {
   ]};
 }
 
-/** ---------- Route ---------- */
+/** ---------- Route Handler ---------- */
 export async function POST(req: NextRequest) {
   try {
     const form = await req.formData();
@@ -185,14 +201,14 @@ export async function POST(req: NextRequest) {
             Array.isArray((b as any).bbox_rel) && (b as any).bbox_rel.length === 4 && typeof (b as any).confidence === "number"
           );
         }
-      } catch { /* ignore */ }
+      } catch { /* tolerate malformed seeds */ }
     }
 
     if (!file && !imageUrl) {
       return NextResponse.json({ error: "No file or imageUrl provided" }, { status: 400 });
     }
 
-    // Build source url + audit hash
+    // Construct an OpenAI image source and an audit hash for dedup/trace
     let imageSourceUrl: string;
     let imageHash: string;
 
@@ -214,35 +230,35 @@ export async function POST(req: NextRequest) {
       imageHash = sha256String(imageUrl!);
     }
 
-    // Strict schema prompt; GPT refines labels given YOLO seeds; JSON only
+    // Strict JSON schema; the model refines labels using YOLO seeds if provided
     const system = `
-Return ONLY valid JSON matching EXACTLY this shape (no prose, no markdown):
+    Return ONLY valid JSON matching EXACTLY this shape (no prose, no markdown):
 
-{
-  "vehicle": { "make": string | null, "model": string | null, "color": string | null, "confidence": number },
-  "damage_items": Array<{
-    "zone": "front"|"front-left"|"left"|"rear-left"|"rear"|"rear-right"|"right"|"front-right"|"roof"|"unknown",
-    "part": "bumper"|"fender"|"door"|"hood"|"trunk"|"quarter-panel"|"headlight"|"taillight"|"grille"|"mirror"|"windshield"|"wheel"|"unknown",
-    "damage_type": "dent"|"scratch"|"crack"|"paint-chips"|"broken"|"bent"|"missing"|"glass-crack"|"unknown",
-    "severity": 1|2|3|4|5,
-    "confidence": number,
-    "est_labor_hours": number,
-    "needs_paint": boolean,
-    "likely_parts": string[],
-    "bbox_rel"?: [number, number, number, number],
-    "polygon_rel"?: Array<[number, number]>
-  }>,
-  "narrative": string,
-  "normalization_notes": string
-}
+    {
+      "vehicle": { "make": string | null, "model": string | null, "color": string | null, "confidence": number },
+      "damage_items": Array<{
+        "zone": "front"|"front-left"|"left"|"rear-left"|"rear"|"rear-right"|"right"|"front-right"|"roof"|"unknown",
+        "part": "bumper"|"fender"|"door"|"hood"|"trunk"|"quarter-panel"|"headlight"|"taillight"|"grille"|"mirror"|"windshield"|"wheel"|"unknown",
+        "damage_type": "dent"|"scratch"|"crack"|"paint-chips"|"broken"|"bent"|"missing"|"glass-crack"|"unknown",
+        "severity": 1|2|3|4|5,
+        "confidence": number,
+        "est_labor_hours": number,
+        "needs_paint": boolean,
+        "likely_parts": string[],
+        "bbox_rel"?: [number, number, number, number],
+        "polygon_rel"?: Array<[number, number]>
+      }>,
+      "narrative": string,
+      "normalization_notes": string
+    }
 
-Rules:
-- Confidence ∈ [0,1]. Severity 1..5 (1=very minor, 5=severe/structural). Be conservative.
-- est_labor_hours realistic per item; likely_parts may be empty.
-- Geometry normalized in 0..1. Prefer polygon_rel for irregular scratches; else bbox_rel.
-- If YOLO seeds are provided, ALIGN your geometry/labels to those regions when applicable; avoid inventing far-away areas.
-- No extra keys. JSON only.
-`.trim();
+    Rules:
+    - Confidence ∈ [0,1]. Severity 1..5 (1=very minor, 5=severe/structural). Be conservative.
+    - est_labor_hours realistic per item; likely_parts may be empty.
+    - Geometry normalized in 0..1. Prefer polygon_rel for irregular scratches; else bbox_rel.
+    - If YOLO seeds are provided, ALIGN your geometry/labels to those regions when applicable; avoid inventing far-away areas.
+    - No extra keys. JSON only.
+    `.trim();
 
     const yoloContext = yoloSeeds.length ? `YOLO_SEEDS: ${JSON.stringify(yoloSeeds.slice(0, 12))}` : `YOLO_SEEDS: []`;
 
@@ -274,7 +290,7 @@ Rules:
       return NextResponse.json({ error: "Model returned invalid JSON" }, { status: 502 });
     }
 
-    // Normalize/repair items
+    // Normalize/repair items defensively
     const itemsIn = Array.isArray(parsed.damage_items) ? parsed.damage_items : [];
     const items: DamageItem[] = itemsIn.map((d) => {
       const sev = (typeof d.severity === "number" && d.severity >= 1 && d.severity <= 5 ? d.severity : 2) as 1|2|3|4|5;
@@ -307,7 +323,7 @@ Rules:
       return out;
     });
 
-    // If LLM returned zero items but YOLO had seeds, create placeholders so estimate & UI don’t collapse.
+    // Preserve UI behavior: if model returns no items but YOLO provided boxes, synthesize placeholders
     const itemsFinal: DamageItem[] = items.length ? items : yoloSeeds.map((b) => ({
       zone: "unknown",
       part: "unknown",

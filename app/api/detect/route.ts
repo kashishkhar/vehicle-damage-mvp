@@ -1,4 +1,11 @@
 // app/api/detect/route.ts
+// --------------------------------------------------------------------------------------
+// Car Damage Estimator — Detect Route (server)
+// - Accepts file or URL, produces lightweight validation + YOLO boxes via Roboflow
+// - Runs a fast OpenAI classifier for usability (vehicle present? quality OK?)
+// - Returns a compact payload used by the client and the analyze step
+// --------------------------------------------------------------------------------------
+
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import crypto from "crypto";
@@ -35,22 +42,13 @@ const ROBOFLOW_API_KEY = process.env.ROBOFLOW_API_KEY || "";
 const ROBOFLOW_MODEL = process.env.ROBOFLOW_MODEL || "";
 const ROBOFLOW_VERSION = process.env.ROBOFLOW_VERSION || "";
 
-// --- utils ---
-function sha256(buf: Buffer) {
-  return crypto.createHash("sha256").update(buf).digest("hex");
-}
-function sha256String(s: string) {
-  return crypto.createHash("sha256").update(s, "utf8").digest("hex");
-}
+/** ---------- Utils ---------- */
+function sha256(buf: Buffer) { return crypto.createHash("sha256").update(buf).digest("hex"); }
+function sha256String(s: string) { return crypto.createHash("sha256").update(s, "utf8").digest("hex"); }
+function isRecord(v: unknown): v is Record<string, unknown> { return typeof v === "object" && v !== null; }
+function num(v: unknown): number | undefined { return typeof v === "number" ? v : undefined; }
 
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null;
-}
-function num(v: unknown): number | undefined {
-  return typeof v === "number" ? v : undefined;
-}
-
-// Extract Roboflow predictions flexibly
+// Extract Roboflow predictions, tolerating multiple shapes
 function extractPredictions(obj: unknown): any[] {
   if (!isRecord(obj)) return [];
   if (Array.isArray(obj.predictions)) return obj.predictions;
@@ -59,6 +57,7 @@ function extractPredictions(obj: unknown): any[] {
   return [];
 }
 
+// Call Roboflow hosted inference and convert to normalized boxes
 async function detectWithRoboflow(imageUrlOrDataUrl: string): Promise<YoloBox[]> {
   if (!ROBOFLOW_API_KEY || !ROBOFLOW_MODEL || !ROBOFLOW_VERSION) return [];
 
@@ -67,7 +66,6 @@ async function detectWithRoboflow(imageUrlOrDataUrl: string): Promise<YoloBox[]>
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      // Roboflow expects "image=<URL or base64 data URL>"
       body: new URLSearchParams({ image: imageUrlOrDataUrl }).toString(),
     });
 
@@ -128,7 +126,7 @@ async function detectWithRoboflow(imageUrlOrDataUrl: string): Promise<YoloBox[]>
   }
 }
 
-// Very small, cheap quality gate (vehicle? usable quality?)
+// Fast quality/vehicle gate via OpenAI (cost-efficient, deterministic)
 async function quickQualityGate(imageUrlOrDataUrl: string): Promise<{
   is_vehicle: boolean;
   quality_ok: boolean;
@@ -171,7 +169,7 @@ Rules:
   try {
     parsed = JSON.parse(completion.choices?.[0]?.message?.content ?? "{}");
   } catch {
-    // fall back: unknown vehicle/quality
+    // Fallback: assume usable but low-confidence (keeps UX smooth)
     parsed = {
       is_vehicle: true,
       quality_ok: true,
@@ -227,11 +225,11 @@ export async function POST(req: NextRequest) {
       imageHash = sha256String(imageUrl!);
     }
 
-    // YOLO (Roboflow) boxes
-    const yolo_boxes = await detectWithRoboflow(imageSourceUrl);
-
-    // Quick quality/vehicle gate
-    const q = await quickQualityGate(imageSourceUrl);
+    // YOLO (Roboflow) boxes + quick gate
+    const [yolo_boxes, q] = await Promise.all([
+      detectWithRoboflow(imageSourceUrl),
+      quickQualityGate(imageSourceUrl),
+      ]);
 
     const payload: DetectPayload = {
       model: MODEL_VEHICLE,
