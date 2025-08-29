@@ -65,7 +65,6 @@ export type AnalyzePayload = {
 };
 
 /** ---------- Env & Constants ---------- */
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 const MODEL_ID = process.env.MODEL_VISION || "gpt-4o-mini";
 
 const LABOR = Number(process.env.LABOR_RATE ?? 95);
@@ -77,12 +76,47 @@ const AUTO_MIN_CONF = Number(process.env.AUTO_MIN_CONF ?? 0.75);
 const SPEC_MIN_COST = Number(process.env.SPECIALIST_MIN_COST ?? 5000);
 const SPEC_MIN_SEVERITY = Number(process.env.SPECIALIST_MIN_SEVERITY ?? 4);
 
-/** ---------- Utils ---------- */
-function sha256(buf: Buffer) {
-  return crypto.createHash("sha256").update(buf).digest("hex");
+/** ---------- OpenAI client (lazy) ---------- */
+let _openai: OpenAI | null = null;
+function getOpenAI(): OpenAI {
+  if (_openai) return _openai;
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) throw new Error("OPENAI_API_KEY environment variable is missing or empty");
+  _openai = new OpenAI({ apiKey: key });
+  return _openai;
 }
-function sha256String(s: string) {
-  return crypto.createHash("sha256").update(s, "utf8").digest("hex");
+
+/** ---------- Utils ---------- */
+function sha256(buf: Buffer) { return crypto.createHash("sha256").update(buf).digest("hex"); }
+function sha256String(s: string) { return crypto.createHash("sha256").update(s, "utf8").digest("hex"); }
+function isRecord(v: unknown): v is Record<string, unknown> { return typeof v === "object" && v !== null; }
+
+/** ---- Type guards to avoid `any` ---- */
+type BBoxRel = [number, number, number, number];
+type PolyRel = [number, number][];
+
+function isBBoxRel(v: unknown): v is BBoxRel {
+  return Array.isArray(v) && v.length === 4 && v.every(n => typeof n === "number" && n >= 0 && n <= 1);
+}
+function isPolygonRel(v: unknown): v is PolyRel {
+  return Array.isArray(v)
+    && v.length >= 3 && v.length <= 12
+    && v.every(pt =>
+      Array.isArray(pt)
+      && pt.length === 2
+      && typeof pt[0] === "number" && pt[0] >= 0 && pt[0] <= 1
+      && typeof pt[1] === "number" && pt[1] >= 0 && pt[1] <= 1
+    );
+}
+
+type YoloSeed = { bbox_rel: BBoxRel; confidence: number };
+function isYoloSeed(v: unknown): v is YoloSeed {
+  if (!isRecord(v)) return false;
+  return typeof v["confidence"] === "number" && isBBoxRel(v["bbox_rel"]);
+}
+
+function getNum(obj: Record<string, unknown>, key: string): number | undefined {
+  return typeof obj[key] === "number" ? (obj[key] as number) : undefined;
 }
 
 // Approximate bodyshop labor hours per part × severity multiplier
@@ -149,15 +183,15 @@ function estimateFromItems(items: DamageItem[]) {
 
 // Weighted average confidence (heavier weight for higher severity)
 function aggregateConfidence(items: DamageItem[]) {
-  let num = 0, den = 0;
+  let numr = 0, den = 0;
   for (const d of items) {
     const sev = Number(d.severity ?? 1);
     const conf = Number(d.confidence ?? 0.5);
     const w = 1 + 0.2 * (sev - 1);
-    num += conf * w;
+    numr += conf * w;
     den += w;
   }
-  return den ? num / den : 0.5;
+  return den ? numr / den : 0.5;
 }
 
 // Policy routing decision (kept identical to existing thresholds)
@@ -195,11 +229,10 @@ export async function POST(req: NextRequest) {
     const yoloSeedsRaw = (form.get("yolo") as string | null)?.toString() || "";
     let yoloSeeds: { bbox_rel: [number,number,number,number]; confidence: number }[] = [];
     if (yoloSeedsRaw) {
-      try { const parsed = JSON.parse(yoloSeedsRaw) as unknown;
+      try {
+        const parsed = JSON.parse(yoloSeedsRaw) as unknown;
         if (Array.isArray(parsed)) {
-          yoloSeeds = parsed.filter((b): b is { bbox_rel: [number,number,number,number]; confidence: number } =>
-            Array.isArray((b as any).bbox_rel) && (b as any).bbox_rel.length === 4 && typeof (b as any).confidence === "number"
-          );
+          yoloSeeds = (parsed as unknown[]).filter(isYoloSeed) as YoloSeed[];
         }
       } catch { /* tolerate malformed seeds */ }
     }
@@ -262,6 +295,7 @@ export async function POST(req: NextRequest) {
 
     const yoloContext = yoloSeeds.length ? `YOLO_SEEDS: ${JSON.stringify(yoloSeeds.slice(0, 12))}` : `YOLO_SEEDS: []`;
 
+    const client = getOpenAI();
     const completion = await client.chat.completions.create({
       model: MODEL_ID,
       temperature: 0,
@@ -280,45 +314,46 @@ export async function POST(req: NextRequest) {
     });
 
     const raw = completion.choices?.[0]?.message?.content ?? "{}";
-    let parsed: {
-      vehicle?: Vehicle;
-      damage_items?: DamageItem[];
-      narrative?: string;
-      normalization_notes?: string;
-    };
+    let parsed: unknown;
     try { parsed = JSON.parse(raw); } catch {
       return NextResponse.json({ error: "Model returned invalid JSON" }, { status: 502 });
     }
 
     // Normalize/repair items defensively
-    const itemsIn = Array.isArray(parsed.damage_items) ? parsed.damage_items : [];
-    const items: DamageItem[] = itemsIn.map((d) => {
-      const sev = (typeof d.severity === "number" && d.severity >= 1 && d.severity <= 5 ? d.severity : 2) as 1|2|3|4|5;
-      const p = (d.part ?? "unknown") as Part;
-      const ht = typeof d.est_labor_hours === "number" ? d.est_labor_hours : hoursFor(p, sev);
-      const paint = typeof d.needs_paint === "boolean" ? d.needs_paint : needsPaintFor(String(d.damage_type || ""), sev, p);
-      const conf = typeof d.confidence === "number" ? Math.max(0, Math.min(1, d.confidence)) : 0.5;
+    const itemsIn = isRecord(parsed) && Array.isArray(parsed["damage_items"])
+      ? (parsed["damage_items"] as unknown[])
+      : [];
+    const items: DamageItem[] = itemsIn.map((dIn) => {
+      const d = isRecord(dIn) ? dIn : {};
+      const sevRaw = d["severity"];
+      const sev = (typeof sevRaw === "number" && sevRaw >= 1 && sevRaw <= 5 ? sevRaw : 2) as 1|2|3|4|5;
+      const p = (typeof d["part"] === "string" ? d["part"] : "unknown") as Part;
+      const estRaw = d["est_labor_hours"];
+      const ht = typeof estRaw === "number" ? estRaw : hoursFor(p, sev);
+      const needsRaw = d["needs_paint"];
+      const dmgType = (typeof d["damage_type"] === "string" ? d["damage_type"] : "unknown") as DamageType;
+      const paint = typeof needsRaw === "boolean" ? needsRaw : needsPaintFor(String(dmgType || ""), sev, p);
+      const confRaw = d["confidence"];
+      const conf = typeof confRaw === "number" ? Math.max(0, Math.min(1, confRaw)) : 0.5;
 
       const out: DamageItem = {
-        zone: (d.zone ?? "unknown") as Zone,
+        zone: (typeof d["zone"] === "string" ? d["zone"] : "unknown") as Zone,
         part: p,
-        damage_type: (d.damage_type ?? "unknown") as DamageType,
+        damage_type: dmgType,
         severity: sev,
         confidence: conf,
         est_labor_hours: ht,
         needs_paint: paint,
-        likely_parts: Array.isArray(d.likely_parts) ? d.likely_parts : [],
+        likely_parts: Array.isArray(d["likely_parts"]) ? (d["likely_parts"] as unknown[]).map(String) : [],
       };
 
-      const bb = (d as any).bbox_rel;
-      if (Array.isArray(bb) && bb.length === 4 && bb.every((n) => typeof n === "number" && n >= 0 && n <= 1)) {
+      const bb = d["bbox_rel"];
+      if (isBBoxRel(bb)) {
         out.bbox_rel = [bb[0], bb[1], bb[2], bb[3]];
       }
-      const poly = (d as any).polygon_rel;
-      if (Array.isArray(poly) && poly.length >= 3 && poly.length <= 12 && poly.every(
-        (pt) => Array.isArray(pt) && pt.length === 2 && pt.every((n) => typeof n === "number" && n >= 0 && n <= 1)
-      )) {
-        out.polygon_rel = poly.map((pt: [number, number]) => [pt[0], pt[1]]);
+      const poly = d["polygon_rel"];
+      if (isPolygonRel(poly)) {
+        out.polygon_rel = (poly as PolyRel).map((pt) => [pt[0], pt[1]]);
       }
       return out;
     });
@@ -339,20 +374,34 @@ export async function POST(req: NextRequest) {
     const estimate = estimateFromItems(itemsFinal);
     const decision = routeDecision(itemsFinal, estimate);
 
+    const narrative = isRecord(parsed) && typeof parsed["narrative"] === "string" ? (parsed["narrative"] as string) : "";
+    const normalization_notes =
+      isRecord(parsed) && typeof parsed["normalization_notes"] === "string"
+        ? (parsed["normalization_notes"] as string)
+        : "";
+
+    const vehicleRec = isRecord(parsed) && isRecord(parsed["vehicle"]) ? (parsed["vehicle"] as Record<string, unknown>) : {};
+    const vehicle: Vehicle = {
+      make: typeof vehicleRec["make"] === "string" ? (vehicleRec["make"] as string) : null,
+      model: typeof vehicleRec["model"] === "string" ? (vehicleRec["model"] as string) : null,
+      color: typeof vehicleRec["color"] === "string" ? (vehicleRec["color"] as string) : null,
+      confidence: typeof vehicleRec["confidence"] === "number" ? (vehicleRec["confidence"] as number) : 0,
+    };
+
     const damage_summary = (itemsFinal.length
       ? itemsFinal.map((d) => `${d.zone} ${d.part} — ${d.damage_type}, sev ${d.severity}`).join("; ")
-      : (parsed.narrative || "")
+      : narrative
     ).slice(0, 400);
 
     const payload: AnalyzePayload = {
       schema_version: "1.3.0",
       model: MODEL_ID,
       runId: crypto.randomUUID(),
-      image_sha256: imageHash,
-      vehicle: parsed.vehicle ?? { make: null, model: null, color: null, confidence: 0 },
+      image_sha256: (typeof imageHash === "string" ? imageHash : String(imageHash)) as string,
+      vehicle,
       damage_items: itemsFinal,
-      narrative: parsed.narrative ?? "",
-      normalization_notes: parsed.normalization_notes ?? "",
+      narrative,
+      normalization_notes,
       estimate,
       decision,
       damage_summary,

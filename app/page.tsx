@@ -292,8 +292,8 @@ function buildDamageSummary(result: AnalyzePayload): string {
     const zonePart = [d.zone, d.part].filter(Boolean).join(" ");
     let phrase = `${sevText} ${typeText} on the ${zonePart}`;
     if (d.needs_paint) phrase += ` requiring repainting`;
-    if (Array.isArray((d as any).likely_parts) && (d as any).likely_parts.length) {
-      phrase += ` with possible replacement of ${(d as any).likely_parts.join(", ")}`;
+    if (Array.isArray(d.likely_parts) && d.likely_parts.length) {
+      phrase += ` with possible replacement of ${d.likely_parts.join(", ")}`;
     }
     return phrase;
   });
@@ -410,7 +410,7 @@ function DamageTable(props: {
       <div className="mb-3 flex items-center justify-end gap-2">
         <select
           value={fPaint}
-          onChange={(e) => setFPaint(e.target.value as any)}
+          onChange={(e) => setFPaint(e.target.value as "all" | "yes" | "no")}
           className="w-28 rounded border border-neutral-200 bg-white px-2 py-1 text-xs"
         >
           <option value="all">Paint: All</option>
@@ -620,7 +620,7 @@ export default function Home() {
       if (Array.isArray(detectJson?.issues) && detectJson.issues.length) {
         setValidationIssues(detectJson.issues);
       }
-    } catch (err) {
+    } catch {
       setError("We couldn’t process that image or link. Try a different photo or a direct image URL.");
     } finally {
       setLoading(false);
@@ -719,7 +719,8 @@ export default function Home() {
         </div>
       </header>
 
-      {/* Layout */}
+      {/* Layout */
+      }
       <div className="mx-auto max-w-7xl px-6 py-6 grid gap-6 lg:grid-cols-12">
         {/* Left: Image column */}
         <section className="lg:col-span-4 print:hidden">
@@ -844,8 +845,9 @@ export default function Home() {
                 <div>
                   <span className="font-medium">Confidence bands:</span> High ≥ {Math.round(CONF_HIGH * 100)}% • Medium ≥ {Math.round(CONF_MED * 100)}% • otherwise Low
                 </div>
-                <div>
-                  <span className="font-medium">Cost assumptions:</span> Labor rate & paint/materials from environment; parts allowance added when severity is high or part replacements are likely.
+                <div className="font-medium">Cost assumptions:</div>
+                <div className="text-neutral-600">
+                  Labor rate & paint/materials from environment; parts allowance added when severity is high or part replacements are likely.
                 </div>
                 <div className="text-neutral-500">This report combines YOLO geometry for overlays and GPT vision for labeling and narrative.</div>
               </div>
