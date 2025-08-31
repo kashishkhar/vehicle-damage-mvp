@@ -4,65 +4,32 @@
 // - Accepts an uploaded image (file) or a public image URL
 // - Calls OpenAI Vision to produce structured damage JSON
 // - Normalizes/repairs the JSON, computes estimate + routing, and returns payload
-// - Functionality preserved; implementation clarified, typed, and documented
 // --------------------------------------------------------------------------------------
 
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import crypto from "crypto";
+import {
+  AnalyzePayload,
+  DamageItem,
+  Vehicle,
+  Part,
+  DetectPayload,
+} from "../../types";
 
 export const runtime = "nodejs";
 
-/** ---------- Types ---------- */
-type Zone =
-  | "front" | "front-left" | "left" | "rear-left" | "rear"
-  | "rear-right" | "right" | "front-right" | "roof" | "unknown";
-type Part =
-  | "bumper" | "fender" | "door" | "hood" | "trunk"
-  | "quarter-panel" | "headlight" | "taillight" | "grille"
-  | "mirror" | "windshield" | "wheel" | "unknown";
-type DamageType =
-  | "dent" | "scratch" | "crack" | "paint-chips"
-  | "broken" | "bent" | "missing" | "glass-crack" | "unknown";
+/** ---------- Error helper (adds error_code, unchanged UI behavior) ---------- */
+const ERR = {
+  NO_IMAGE: "E_NO_IMAGE",
+  BAD_URL: "E_BAD_URL",
+  MODEL_JSON: "E_MODEL_JSON",
+  SERVER: "E_SERVER",
+} as const;
 
-export type DamageItem = {
-  zone: Zone;
-  part: Part;
-  damage_type: DamageType;
-  severity: 1 | 2 | 3 | 4 | 5;
-  confidence: number;
-  est_labor_hours: number;
-  needs_paint: boolean;
-  likely_parts: string[];
-  bbox_rel?: [number, number, number, number];
-  polygon_rel?: [number, number][];
-};
-
-export type Vehicle = {
-  make: string | null;
-  model: string | null;
-  color: string | null;
-  confidence: number;
-};
-
-export type AnalyzePayload = {
-  schema_version: string;
-  model: string;
-  runId: string;
-  image_sha256: string;
-  vehicle: Vehicle;
-  damage_items: DamageItem[];
-  narrative: string;
-  normalization_notes: string;
-  estimate: {
-    currency: "USD";
-    cost_low: number;
-    cost_high: number;
-    assumptions: string[];
-  };
-  decision: { label: "AUTO-APPROVE" | "INVESTIGATE" | "SPECIALIST"; reasons: string[] };
-  damage_summary: string;
-};
+function errJson(message: string, code: string, status = 400) {
+  return NextResponse.json({ error: message, error_code: code }, { status });
+}
 
 /** ---------- Env & Constants ---------- */
 const MODEL_ID = process.env.MODEL_VISION || "gpt-4o-mini";
@@ -91,7 +58,7 @@ function sha256(buf: Buffer) { return crypto.createHash("sha256").update(buf).di
 function sha256String(s: string) { return crypto.createHash("sha256").update(s, "utf8").digest("hex"); }
 function isRecord(v: unknown): v is Record<string, unknown> { return typeof v === "object" && v !== null; }
 
-/** ---- Type guards to avoid `any` ---- */
+/** ---- Local tuple guards (unchanged) ---- */
 type BBoxRel = [number, number, number, number];
 type PolyRel = [number, number][];
 
@@ -119,7 +86,7 @@ function getNum(obj: Record<string, unknown>, key: string): number | undefined {
   return typeof obj[key] === "number" ? (obj[key] as number) : undefined;
 }
 
-// Approximate bodyshop labor hours per part × severity multiplier
+// Approximate bodyshop labor hours per part × severity multiplier (unchanged)
 function hoursFor(part: Part, sev: number) {
   const base =
     part === "bumper" ? 1.2 :
@@ -137,17 +104,17 @@ function hoursFor(part: Part, sev: number) {
   return +(base * sevMult).toFixed(2);
 }
 
-// Paint heuristic: most panels need paint above sev>=2; glass/lights typically do not
+// Paint heuristic (unchanged)
 function needsPaintFor(type: string, sev: number, part: Part) {
   if (["windshield", "headlight", "taillight", "mirror"].includes(part)) return false;
   if (type.includes("scratch") || type.includes("paint")) return true;
   return sev >= 2;
 }
 
-// Roll up labor/paint/parts → cost band with variance
+// Roll up labor/paint/parts → cost band with variance (unchanged)
 function estimateFromItems(items: DamageItem[]) {
   let labor = 0, paint = 0, parts = 0;
-  const paintedZones = new Set<Zone>();
+  const paintedZones = new Set<string>();
 
   for (const d of items) {
     const sev = Number(d.severity ?? 1);
@@ -155,9 +122,9 @@ function estimateFromItems(items: DamageItem[]) {
     labor += hrs * LABOR;
 
     const needPaint = typeof d.needs_paint === "boolean" ? d.needs_paint : needsPaintFor(String(d.damage_type || ""), sev, d.part);
-    if (needPaint && d.zone && !paintedZones.has(d.zone)) {
+    if (needPaint && (d.zone as string) && !paintedZones.has(d.zone as string)) {
       paint += PAINT;
-      paintedZones.add(d.zone);
+      paintedZones.add(d.zone as string);
     }
 
     const likelyParts = Array.isArray(d.likely_parts) ? d.likely_parts : [];
@@ -181,7 +148,7 @@ function estimateFromItems(items: DamageItem[]) {
   };
 }
 
-// Weighted average confidence (heavier weight for higher severity)
+// Weighted confidence (unchanged)
 function aggregateConfidence(items: DamageItem[]) {
   let numr = 0, den = 0;
   for (const d of items) {
@@ -194,7 +161,7 @@ function aggregateConfidence(items: DamageItem[]) {
   return den ? numr / den : 0.5;
 }
 
-// Policy routing decision (kept identical to existing thresholds)
+// Policy routing (unchanged)
 function routeDecision(items: DamageItem[], estimate: { cost_high: number }) {
   const maxSev = items.reduce((m, d) => Math.max(m, Number(d.severity ?? 1)), 0);
   const agg = aggregateConfidence(items);
@@ -218,14 +185,15 @@ function routeDecision(items: DamageItem[], estimate: { cost_high: number }) {
   ]};
 }
 
-/** ---------- Route Handler ---------- */
+/** ---------- Handler ---------- */
 export async function POST(req: NextRequest) {
+  console.time("analyze_total");
   try {
     const form = await req.formData();
     const file = form.get("file") as File | null;
     const imageUrl = (form.get("imageUrl") as string | null)?.toString().trim() || null;
 
-    // Optional YOLO seeds passed from client as JSON string (array of {bbox_rel, confidence})
+    // Optional YOLO seeds passed from client
     const yoloSeedsRaw = (form.get("yolo") as string | null)?.toString() || "";
     let yoloSeeds: { bbox_rel: [number,number,number,number]; confidence: number }[] = [];
     if (yoloSeedsRaw) {
@@ -238,10 +206,10 @@ export async function POST(req: NextRequest) {
     }
 
     if (!file && !imageUrl) {
-      return NextResponse.json({ error: "No file or imageUrl provided" }, { status: 400 });
+      return errJson("No file or imageUrl provided", ERR.NO_IMAGE, 400);
     }
 
-    // Construct an OpenAI image source and an audit hash for dedup/trace
+    // Construct an OpenAI image source and an audit hash
     let imageSourceUrl: string;
     let imageHash: string;
 
@@ -254,10 +222,10 @@ export async function POST(req: NextRequest) {
       try {
         const u = new URL(imageUrl!);
         if (!/^https?:$/.test(u.protocol)) {
-          return NextResponse.json({ error: "imageUrl must be http(s)" }, { status: 400 });
+          return errJson("imageUrl must be http(s)", ERR.BAD_URL, 400);
         }
       } catch {
-        return NextResponse.json({ error: "Invalid imageUrl" }, { status: 400 });
+        return errJson("Invalid imageUrl", ERR.BAD_URL, 400);
       }
       imageSourceUrl = imageUrl!;
       imageHash = sha256String(imageUrl!);
@@ -316,10 +284,10 @@ export async function POST(req: NextRequest) {
     const raw = completion.choices?.[0]?.message?.content ?? "{}";
     let parsed: unknown;
     try { parsed = JSON.parse(raw); } catch {
-      return NextResponse.json({ error: "Model returned invalid JSON" }, { status: 502 });
+      return errJson("Model returned invalid JSON", ERR.MODEL_JSON, 502);
     }
 
-    // Normalize/repair items defensively
+    // Normalize/repair items (unchanged)
     const itemsIn = isRecord(parsed) && Array.isArray(parsed["damage_items"])
       ? (parsed["damage_items"] as unknown[])
       : [];
@@ -331,15 +299,15 @@ export async function POST(req: NextRequest) {
       const estRaw = d["est_labor_hours"];
       const ht = typeof estRaw === "number" ? estRaw : hoursFor(p, sev);
       const needsRaw = d["needs_paint"];
-      const dmgType = (typeof d["damage_type"] === "string" ? d["damage_type"] : "unknown") as DamageType;
+      const dmgType = (typeof d["damage_type"] === "string" ? d["damage_type"] : "unknown");
       const paint = typeof needsRaw === "boolean" ? needsRaw : needsPaintFor(String(dmgType || ""), sev, p);
       const confRaw = d["confidence"];
       const conf = typeof confRaw === "number" ? Math.max(0, Math.min(1, confRaw)) : 0.5;
 
       const out: DamageItem = {
-        zone: (typeof d["zone"] === "string" ? d["zone"] : "unknown") as Zone,
+        zone: (typeof d["zone"] === "string" ? d["zone"] : "unknown") as DamageItem["zone"],
         part: p,
-        damage_type: dmgType,
+        damage_type: dmgType as DamageItem["damage_type"],
         severity: sev,
         confidence: conf,
         est_labor_hours: ht,
@@ -348,17 +316,13 @@ export async function POST(req: NextRequest) {
       };
 
       const bb = d["bbox_rel"];
-      if (isBBoxRel(bb)) {
-        out.bbox_rel = [bb[0], bb[1], bb[2], bb[3]];
-      }
+      if (isBBoxRel(bb)) out.bbox_rel = [bb[0], bb[1], bb[2], bb[3]];
       const poly = d["polygon_rel"];
-      if (isPolygonRel(poly)) {
-        out.polygon_rel = (poly as PolyRel).map((pt) => [pt[0], pt[1]]);
-      }
+      if (isPolygonRel(poly)) out.polygon_rel = (poly as PolyRel).map((pt) => [pt[0], pt[1]]);
       return out;
     });
 
-    // Preserve UI behavior: if model returns no items but YOLO provided boxes, synthesize placeholders
+    // Preserve UI behavior re: YOLO fallback
     const itemsFinal: DamageItem[] = items.length ? items : yoloSeeds.map((b) => ({
       zone: "unknown",
       part: "unknown",
@@ -407,9 +371,11 @@ export async function POST(req: NextRequest) {
       damage_summary,
     };
 
+    console.timeEnd("analyze_total");
     return NextResponse.json(payload);
   } catch (e: unknown) {
+    console.timeEnd("analyze_total");
     const msg = e instanceof Error ? e.message : "Server error";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    return errJson(msg, ERR.SERVER, 500);
   }
 }

@@ -13,7 +13,7 @@ export type Vehicle = {
   confidence: number; // 0..1
 };
 
-export type ApiError = { error: string };
+export type ApiError = { error: string; error_code?: string };
 
 /** -------- Detect route types -------- */
 export type DetectPayload = {

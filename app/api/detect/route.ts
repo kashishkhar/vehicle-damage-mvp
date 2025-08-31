@@ -9,37 +9,27 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import crypto from "crypto";
+import { DetectPayload, Vehicle, YoloBoxRel } from "../../types";
 
 export const runtime = "nodejs";
 
-type YoloBox = { bbox_rel: [number, number, number, number]; confidence: number };
-
-type Vehicle = {
-  make: string | null;
-  model: string | null;
-  color: string | null;
-  confidence: number;
-};
-
-type DetectPayload = {
-  model: string;              // labeler model string (for audit)
-  runId: string;
-  image_sha256: string;
-  yolo_boxes: YoloBox[];      // normalized [0..1]
-  vehicle: Vehicle;           // light vehicle guess (optional, we fill minimal)
-  // Validation flags:
-  is_vehicle: boolean;
-  has_damage: boolean;
-  quality_ok: boolean;
-  issues: string[];           // machine-ish labels e.g., ["not_vehicle", "blurry", "low_light", "no_damage"]
-};
-
 const MODEL_VEHICLE = process.env.MODEL_VEHICLE || "gpt-4o-mini"; // small/fast classifier
 
-// Roboflow config (put these in your .env)
+// Roboflow config (optional; route tolerates empty keys)
 const ROBOFLOW_API_KEY = process.env.ROBOFLOW_API_KEY || "";
 const ROBOFLOW_MODEL = process.env.ROBOFLOW_MODEL || "";
 const ROBOFLOW_VERSION = process.env.ROBOFLOW_VERSION || "";
+
+/** ---------- Error helper (adds error_code, unchanged behavior for UI) ---------- */
+const ERR = {
+  NO_IMAGE: "E_NO_IMAGE",
+  BAD_URL: "E_BAD_URL",
+  SERVER: "E_SERVER",
+} as const;
+
+function errJson(message: string, code: string, status = 400) {
+  return NextResponse.json({ error: message, error_code: code }, { status });
+}
 
 /** ---------- OpenAI client (lazy) ---------- */
 let _openai: OpenAI | null = null;
@@ -52,13 +42,13 @@ function getOpenAI(): OpenAI {
 }
 
 /** ---------- Utils ---------- */
-function sha256(buf: Buffer) { return crypto.createHash("sha256").update(buf).digest("hex"); }
-function sha256String(s: string) { return crypto.createHash("sha256").update(s, "utf8").digest("hex"); }
 function isRecord(v: unknown): v is Record<string, unknown> { return typeof v === "object" && v !== null; }
 function num(v: unknown): number | undefined { return typeof v === "number" ? v : undefined; }
 function getNum(obj: Record<string, unknown>, key: string): number | undefined {
   return typeof obj[key] === "number" ? (obj[key] as number) : undefined;
 }
+function sha256(buf: Buffer) { return crypto.createHash("sha256").update(buf).digest("hex"); }
+function sha256String(s: string) { return crypto.createHash("sha256").update(s, "utf8").digest("hex"); }
 
 /** Extract Roboflow predictions, tolerating multiple shapes */
 function extractPredictions(obj: unknown): unknown[] {
@@ -72,7 +62,7 @@ function extractPredictions(obj: unknown): unknown[] {
 }
 
 // Call Roboflow hosted inference and convert to normalized boxes
-async function detectWithRoboflow(imageUrlOrDataUrl: string): Promise<YoloBox[]> {
+async function detectWithRoboflow(imageUrlOrDataUrl: string): Promise<YoloBoxRel[]> {
   if (!ROBOFLOW_API_KEY || !ROBOFLOW_MODEL || !ROBOFLOW_VERSION) return [];
 
   try {
@@ -87,7 +77,7 @@ async function detectWithRoboflow(imageUrlOrDataUrl: string): Promise<YoloBox[]>
     const data: unknown = await res.json();
     const rawPreds = extractPredictions(data);
     const preds = rawPreds.filter(isRecord) as Record<string, unknown>[];
-    const boxes: YoloBox[] = [];
+    const boxes: YoloBoxRel[] = [];
 
     for (const p of preds) {
       const conf = getNum(p, "confidence") ?? getNum(p, "conf") ?? 0.5;
@@ -112,7 +102,7 @@ async function detectWithRoboflow(imageUrlOrDataUrl: string): Promise<YoloBox[]>
         const ny = Math.max(0, Math.min(1, (cy - h / 2) / H));
         const nw = Math.max(0, Math.min(1, w / W));
         const nh = Math.max(0, Math.min(1, h / H));
-        boxes.push({ bbox_rel: [nx, ny, nw, nh], confidence: conf });
+        boxes.push({ bbox_rel: [nx, ny, nw, nh], confidence: conf! });
         continue;
       }
 
@@ -131,7 +121,7 @@ async function detectWithRoboflow(imageUrlOrDataUrl: string): Promise<YoloBox[]>
         const ny = Math.max(0, Math.min(1, ymin));
         const nw = Math.max(0, Math.min(1, xmax - xmin));
         const nh = Math.max(0, Math.min(1, ymax - ymin));
-        boxes.push({ bbox_rel: [nx, ny, nw, nh], confidence: conf });
+        boxes.push({ bbox_rel: [nx, ny, nw, nh], confidence: conf! });
       }
     }
 
@@ -193,8 +183,8 @@ Rules:
     };
   }
 
-  const pv = isRecord(parsed) ? parsed : {};
-  const vehicleObj = isRecord(pv["vehicle"]) ? (pv["vehicle"] as Record<string, unknown>) : {};
+  const pv = (typeof parsed === "object" && parsed !== null ? parsed : {}) as Record<string, unknown>;
+  const vehicleObj = (pv["vehicle"] && typeof pv["vehicle"] === "object" ? (pv["vehicle"] as Record<string, unknown>) : {}) as Record<string, unknown>;
   const vehicle_guess: Vehicle = {
     make: typeof vehicleObj["make"] === "string" ? (vehicleObj["make"] as string) : null,
     model: typeof vehicleObj["model"] === "string" ? (vehicleObj["model"] as string) : null,
@@ -211,13 +201,14 @@ Rules:
 }
 
 export async function POST(req: NextRequest) {
+  console.time("detect_total");
   try {
     const form = await req.formData();
     const file = form.get("file") as File | null;
     const imageUrl = (form.get("imageUrl") as string | null)?.toString().trim() || null;
 
     if (!file && !imageUrl) {
-      return NextResponse.json({ error: "No file or imageUrl provided" }, { status: 400 });
+      return errJson("No file or imageUrl provided", ERR.NO_IMAGE, 400);
     }
 
     // Build source + audit hash
@@ -233,10 +224,10 @@ export async function POST(req: NextRequest) {
       try {
         const u = new URL(imageUrl!);
         if (!/^https?:$/.test(u.protocol)) {
-          return NextResponse.json({ error: "imageUrl must be http(s)" }, { status: 400 });
+          return errJson("imageUrl must be http(s)", ERR.BAD_URL, 400);
         }
       } catch {
-        return NextResponse.json({ error: "Invalid imageUrl" }, { status: 400 });
+        return errJson("Invalid imageUrl", ERR.BAD_URL, 400);
       }
       imageSourceUrl = imageUrl!;
       imageHash = sha256String(imageUrl!);
@@ -260,9 +251,11 @@ export async function POST(req: NextRequest) {
       issues: q.issues,
     };
 
+    console.timeEnd("detect_total");
     return NextResponse.json(payload);
   } catch (e: unknown) {
+    console.timeEnd("detect_total");
     const message = e instanceof Error ? e.message : "detect error";
-    return NextResponse.json({ error: message }, { status: 500 });
+    return errJson(message, ERR.SERVER, 500);
   }
 }

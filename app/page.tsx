@@ -835,11 +835,13 @@ export default function Home() {
               )}
 
               {/* Friendly errors */}
-              {error && (
-                <div className="rounded-lg border border-rose-200/70 bg-rose-50/80 p-3 text-sm text-rose-700 backdrop-blur">
-                  {String(error)}
-                </div>
-              )}
+              <div aria-live="polite">
+                {error && (
+                  <div className="rounded-lg border border-rose-200/70 bg-rose-50/80 p-3 text-sm text-rose-700 backdrop-blur">
+                    {String(error)}
+                  </div>
+                )}
+              </div>
 
               {/* View options */}
               <div className="pt-1 flex flex-col gap-2">
