@@ -1059,11 +1059,10 @@ export default function Home() {
                     type="button"
                     onClick={() => selectSample(s.url)}
                     className="group relative rounded-lg overflow-hidden border border-slate-200 bg-white/60 hover:shadow-sm active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
-                    title={s.label}
+                    title="Sample image"
                   >
-                    <img src={s.url} alt={s.label} className="h-16 w-full object-cover" />
+                    <img src={s.url} alt="Sample image" className="h-16 w-full object-cover" />
                     <div className="absolute inset-x-0 bottom-0 bg-white/80 text-[10px] px-1 py-0.5 text-slate-700 truncate">
-                      {s.label}
                     </div>
                   </button>
                 ))}
@@ -1148,7 +1147,7 @@ export default function Home() {
                     <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                       {/* Severity tile */}
                       <div className={`rounded-xl border px-3 py-2 ${sevClass(metrics.maxSev)}`}>
-                        <div className="text-[11px] opacity-80">Severity (auto-approve if less than {AUTO_MAX_SEVERITY})</div>
+                        <div className="text-[11px] opacity-80">Severity (need ≤ {AUTO_MAX_SEVERITY})</div>
                         <div className="text-sm font-medium">Max {Math.max(0, metrics.maxSev)}</div>
                         {metrics.maxSev >= SPEC_MIN_SEVERITY && (
                           <div className="text-[11px] opacity-80 mt-0.5">Escalates at ≥ {SPEC_MIN_SEVERITY}</div>
@@ -1157,7 +1156,7 @@ export default function Home() {
 
                       {/* Cost tile */}
                       <div className={`rounded-xl border px-3 py-2 ${costClass(metrics.costHigh)}`}>
-                        <div className="text-[11px] opacity-80">Cost (auto-approve if less than {fmtMoney(AUTO_MAX_COST)})</div>
+                        <div className="text-[11px] opacity-80">Cost (need ≤ {fmtMoney(AUTO_MAX_COST)})</div>
                         <div className="text-sm font-medium">
                           High {typeof metrics.costHigh === "number" ? fmtMoney(metrics.costHigh) : "—"}
                         </div>
@@ -1168,9 +1167,9 @@ export default function Home() {
 
                       {/* Confidence tile */}
                       <div className={`rounded-xl border px-3 py-2 ${confClass(metrics.aggConf)}`}>
-                        <div className="text-[11px] opacity-80">Confidence (auto-approve if more than {fmtPct(AUTO_MIN_CONF)})</div>
+                        <div className="text-[11px] opacity-80">Confidence (need ≥ {fmtPct(AUTO_MIN_CONF)})</div>
                         <div className="text-sm font-medium">Avg {fmtPct(metrics.aggConf)}</div>
-                        <div className="text-[11px] opacity-80 mt-0.5">* Doesn’t escalate on its own</div>
+                        <div className="text-[11px] opacity-80 mt-0.5">Doesn’t escalate on its own</div>
                       </div>
                     </div>
                   </div>
